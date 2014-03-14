@@ -48,16 +48,119 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #define BOT_SHM "TSHMM"
 #define BOT_CMD_SEM "TSHMC"
 #define BOT_STATUS_SEM "TSHMS"
+/*static M3HumanoidShmSdsCommand cmd;
+static M3HumanoidShmSdsStatus status;
+static int sds_status_size;
+static int sds_cmd_size;*/
 
 using namespace Eigen;
 using namespace DmpBbo;
 
+class M3ShmManager
+{
+	public:
+		M3ShmManager(){
+			sds_status_size = sizeof(M3HumanoidShmSdsStatus);
+			sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
+			memset(&cmd, 0, sds_cmd_size); // Initialize cmd
+		}
+		
+		~M3ShmManager(){
+			delete status_sem;
+			delete command_sem;
+			delete m3_sds;
+		}
+		
+		M3HumanoidShmSdsCommand cmd;
+		M3HumanoidShmSdsStatus status;
+		int sds_status_size;
+		int sds_cmd_size;
+		SEM* status_sem;
+		SEM* command_sem;
+		M3Sds* m3_sds;
+		
+		bool statusSemInit(std::string sem_name){
+			
+			if(getSemAddr(sem_name.c_str(),status_sem))
+				return true;
+			else
+				return false;
+			/*status_sem = (SEM*)rt_get_adr(nam2num(sem_name.c_str()));
+			if (!status_sem)
+				return false;
+			return true;*/
+		}
+		bool commandSemInit(std::string sem_name){
+			if(getSemAddr(sem_name.c_str(),command_sem))
+				return true;
+			else
+				return false;
+			/*command_sem = (SEM*)rt_get_adr(nam2num(sem_name.c_str()));
+			if (!status_sem)
+				return false;
+			return true;*/
+		}
+		
+		////////////////////////// COMMAND /////////////////////////////
+		void stepCommand(VectorXd& joints_cmd,VectorXd& joints_cmd_dot)
+		{
+			for (int i = 0; i < joints_cmd.size(); i++) // FIX
+			{
+				cmd.right_arm.ctrl_mode[i] = JOINT_ARRAY_MODE_THETA_GC;
+				cmd.right_arm.q_desired[i] = joints_cmd[i];
+				cmd.right_arm.tq_desired[i] = 40.0;
+				cmd.right_arm.slew_rate_q_desired[i] = 300; // 10.0
+				cmd.right_arm.q_stiffness[i] = 1.0;
+			}
+
+			// Lock the semaphore and copy the output data
+			rt_sem_wait(command_sem);
+			memcpy(m3_sds->cmd, &cmd, sds_cmd_size);
+			rt_sem_signal(command_sem);
+			
+		}
+
+		////////////////////////// STATUS /////////////////////////////
+		void stepStatus(VectorXd& joints_status,VectorXd& joints_status_dot)
+		{
+			// Lock the semaphore and copy the input data
+			rt_sem_wait(status_sem);
+			memcpy(&status, m3_sds->status, sds_status_size);
+			rt_sem_signal(status_sem);
+			
+			// Convert status into Eigen vector
+			for (int i = 0; i < joints_status.size(); i++) // FIX
+			{
+				joints_status[i] = status.right_arm.theta[i];
+				joints_status_dot[i] = status.right_arm.thetadot[i];
+			}
+			
+			
+		}	
+		
+		bool m3sdsInit(std::string bot_shm_name){
+			if (m3_sds = (M3Sds*)rt_shm_alloc(nam2num(bot_shm_name.c_str()),sizeof(M3Sds),USE_GFP_KERNEL))
+				return true;
+			else
+				return false;
+		}
+
+	protected:
+		bool getSemAddr(const char* sem_name,SEM* sem){
+			sem = (SEM*)rt_get_adr(nam2num(sem_name));
+			if (!sem)
+				return false;
+			return true;
+		}
+		
+};
+
 /////// Shared data structure:
-struct DmpSds
+struct DmpData
 {
 	Dmp* dmp; 
 	double dt;
-	~DmpSds(){ delete dmp;}
+	~DmpData(){ delete dmp;}
 };
 
 ///////  Trajectory generator:
@@ -126,7 +229,26 @@ Dmp* generateDemoDmp(double dt){
 }
 
 void* dmpLoop(void* args){
-	DmpSds* dmp_sds = (DmpSds*) args;
+	
+	/*SEM* status_sem;
+        SEM* command_sem;
+	
+	sds_status_size = sizeof(M3HumanoidShmSdsStatus);
+        sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
+        memset(&cmd, 0, sds_cmd_size); // Initialize cmd
+        */
+        
+	M3ShmManager shm_manager;
+	
+	// Retrain the dmp_data
+	DmpData* dmp_data = (DmpData*) args;
+	
+	// Attach the thread to the shared memory
+	//M3Sds* m3_sds = new M3Sds;
+	/*if(!attachM3Sds(m3_sds)){
+		printf("ERROR: Cannot attach the thread to the m3 shared data structure\n");
+		return 0;
+	}*/
 	
 	// Create the dmp task
 	RT_TASK* dmp_task;
@@ -136,14 +258,32 @@ void* dmpLoop(void* args){
 		printf("ERROR: Cannot initialize dmp task\n");
 		return 0;
 	}
+	if(!shm_manager.m3sdsInit("TSHMM")){
+		printf("Unable to find the %s shared memory.\n","TSHMM");
+		rt_task_delete(dmp_task);
+		return 0;
+	}
+	if(!shm_manager.statusSemInit("TSHMS")){
+		printf("Unable to find the %s semaphore.\n","TSHMS");
+		rt_task_delete(dmp_task);
+		return 0;
+	}
+	if(!shm_manager.commandSemInit("TSHMC")){
+		printf("Unable to find the %s semaphore.\n","TSHMC");
+		rt_task_delete(dmp_task);
+		return 0;
+	}
 	
-	RTIME tick_period = nano2count(SEC2NANO(dmp_sds->dt)); // This is ~=dt
+	RTIME tick_period = nano2count(SEC2NANO(dmp_data->dt)); // This is ~=dt
 	
-	int dmp_dim = dmp_sds->dmp->dim();
+	int dmp_dim = dmp_data->dmp->dim();
 	VectorXd x(dmp_dim),xd(dmp_dim),x_updated(dmp_dim),xd_updated(dmp_dim);
 	
 	// Dmp initialization
-        dmp_sds->dmp->integrateStart(x,xd);
+	// Read the motors state
+	//shm_manager.stepStatus(x,xd); //FIX This is crashing badly
+	// Set the initial conditions
+        dmp_data->dmp->integrateStart(x,xd);
 	
 	// Start the real time task
 	printf("Starting real-time task\n");
@@ -151,17 +291,16 @@ void* dmpLoop(void* args){
 	rt_make_hard_real_time();
 
 	// RT Loop
-	int i = 0;
 	//long long start_time, end_time, curr_dt;
 	while(1)
 	{
+		// Read the motors state
+		
+		
 		//start_time = nano2count(rt_get_cpu_time_ns());
-		//i++; // Count Loops.
-		//if (i== 10)
-		//	break;
 		
 		// Integrate dmp
-               dmp_sds->dmp->integrateStep(dmp_sds->dt,x,x_updated,xd_updated);
+               dmp_data->dmp->integrateStep(dmp_data->dt,x,x_updated,xd_updated);
 		x = x_updated;
 		
 		std::cout << "****" << std::endl;
@@ -184,19 +323,19 @@ void* dmpLoop(void* args){
 int main(int argc, char *argv[])
 {
 	// Generate a demo dmp and the shared data structure
-	DmpSds* dmp_sds = new DmpSds;
-	dmp_sds->dt = 0.01;
-	dmp_sds->dmp = generateDemoDmp(dmp_sds->dt);
+	DmpData* dmp_data = new DmpData;
+	dmp_data->dt = 0.01;
+	dmp_data->dmp = generateDemoDmp(dmp_data->dt);
 
 	// Create a thread
 	rt_allow_nonroot_hrt(); // It is necessary to spawn tasks
-	int thread_id = rt_thread_create((void*)dmpLoop,dmp_sds,10000);
+	int thread_id = rt_thread_create((void*)dmpLoop,dmp_data,10000);
 	
 	// Join with the thread
 	rt_thread_join(thread_id);
 	
-	// Destroy the dmp_sds
-	delete dmp_sds;
+	// Destroy the dmp_data
+	delete dmp_data;
 }
 
 
