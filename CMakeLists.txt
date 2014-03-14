@@ -2,7 +2,7 @@
 #set(CMAKE_DISABLE_IN_SOURCE_BUILD ON)
 
 # Project name is not mandatory, but you should use it
-project(MEKA_BRIDGE)
+project(MEKA_DMP_BRIDGE)
 
 # States that CMake required version must be greater than 2.6
 cmake_minimum_required(VERSION 2.6)
@@ -65,9 +65,17 @@ find_package(Boost COMPONENTS filesystem system serialization REQUIRED)
 SET(LIBS ${RTAI_LIBRARIES} ${M3_LIBRARIES} ${M3RT_LIBRARIES} pthread dmp dynamicalsystems functionapproximators ${Boost_LIBRARIES})
 include_directories(${M3RT_INCLUDE_DIR} ${RTAI_INCLUDE_DIR} ${M3_INCLUDE_DIR} ${THREADS_INCLUDE_DIR})
 
-add_executable(demoMekaShmTrj src/MekaShmTrj.cpp)
-target_link_libraries(demoMekaShmTrj ${LIBS})
+#add_executable(demoMekaShmTrj src/MekaShmTrj.cpp)
+#target_link_libraries(demoMekaShmTrj ${LIBS})
 
-add_executable(demoMekaShmDmp src/MekaShmDmp.cpp)
-target_link_libraries(demoMekaShmDmp ${LIBS})
-install(TARGETS demoMekaShmDmp DESTINATION ${CMAKE_SOURCE_DIR}/bin)
+#add_executable(demoMekaShmDmp src/MekaShmDmp.cpp)
+#target_link_libraries(demoMekaShmDmp ${LIBS})
+#install(TARGETS demoMekaShmDmp DESTINATION ${CMAKE_SOURCE_DIR}/bin)
+
+add_executable(demoMekaShmDmpGen src/MekaShmDmpGen.cpp)
+target_link_libraries(demoMekaShmDmpGen ${LIBS})
+install(TARGETS demoMekaShmDmpGen DESTINATION ${CMAKE_SOURCE_DIR}/bin)
+
+#add_executable(testDmp src/testDmp.cpp)
+#target_link_libraries(testDmp ${LIBS})
+#install(TARGETS testDmp DESTINATION ${CMAKE_SOURCE_DIR}/bin)

@@ -67,7 +67,7 @@ using namespace DmpBbo;
 void StepHumanoidShm();
 
 ///////  Trajectory generator:
-Trajectory getDemoTrajectory(const VectorXd& ts, const int n_dims);
+Trajectory getDemoTrajectory(const VectorXd& ts, const VectorXd& y_first, const VectorXd& y_last, const double& Tf, const double& Ti);
 
 ///////  Timing functions:
 void SetTimestamp(int64_t  timestamp)
@@ -87,7 +87,8 @@ typedef struct
         M3Sds m3sds; // SDS = shared data structure
         int n_dims;
         Dmp* dmp;
-
+	double dt;
+	
 } M3DMPSds;
 
 ////////////////////////// MAIN COMPUTATION METHOD /////////////////////////////
@@ -100,8 +101,8 @@ void StepHumanoidShm(int cntr,VectorXd &joints_cmds_step,VectorXd & joints_cmds_
         cmd.right_arm.ctrl_mode[i] = JOINT_ARRAY_MODE_THETA_GC;
         cmd.right_arm.q_desired[i] = joints_cmds_step(i);
         cmd.right_arm.tq_desired[i] = 40.0;
-        cmd.right_arm.slew_rate_q_desired[i] = 10.0;
-        cmd.right_arm.q_stiffness[i] = 0.35;
+        cmd.right_arm.slew_rate_q_desired[i] = 300; // 10.0
+        cmd.right_arm.q_stiffness[i] = 1.0;
       }
 }
 
@@ -113,7 +114,9 @@ static void* rt_system_thread(void * arg)
         RT_TASK *task;
         int cntr_outer_loop = 0;
         M3DMPSds* dmpsds = (M3DMPSds*) arg;
-
+	
+	VectorXd x(dmpsds->dmp->dim()),xd(dmpsds->dmp->dim()),x_updated(dmpsds->dmp->dim()),xd_updated(dmpsds->dmp->dim());
+		
         usleep(100);
 
         printf("Starting real-time thread\n",0);
@@ -123,7 +126,7 @@ static void* rt_system_thread(void * arg)
 
         memset(&cmd, 0, sds_cmd_size);
 
-        task = rt_task_init_schmod(nam2num("TSHMP"), 0, 0, 0, SCHED_FIFO, 0xF);
+        task = rt_task_init_schmod(nam2num("MAMMT"), 0, 0, 0, SCHED_FIFO, 0xF); //TSHMP
         rt_allow_nonroot_hrt();
         if (task == NULL)
         {
@@ -159,19 +162,13 @@ static void* rt_system_thread(void * arg)
         memcpy(&status, dmpsds->m3sds.status, sds_status_size);
         rt_sem_signal(status_sem);
 
-        VectorXd x,xd,x_updated,xd_updated;
-        x.resize(dmpsds->n_dims);
-        xd.resize(dmpsds->n_dims);
-        x_updated.resize(dmpsds->n_dims);
-        xd_updated.resize(dmpsds->n_dims);
-
         // Convert status into Eigen vector
-        for (int i = 0; i < dmpsds->n_dims; i++)
+        /*for (int i = 0; i < dmpsds->n_dims; i++)
         {
             x(i) = status.right_arm.theta[i];
             xd(i) = status.right_arm.thetadot[i];
-        }
-
+        }*/
+       
         // Initialization
         dmpsds->dmp->integrateStart(x,xd);
 
@@ -185,17 +182,20 @@ static void* rt_system_thread(void * arg)
                 rt_sem_signal(status_sem);
 
                 // Convert status into Eigen vector
-                for (int i = 0; i < dmpsds->n_dims; i++)
+                /*for (int i = 0; i < dmpsds->n_dims; i++)
                 {
                     x(i) = status.right_arm.theta[i];
                     xd(i) = status.right_arm.thetadot[i];
-                }
+                }*/
 
                 //MatrixXd joints_cmds_step = sys->joints_cmds.block(std::floor(cntr_outer_loop/sys->n_time_steps_inner_loop),0,1,sys->n_dims);
                 //MatrixXd joints_cmds_dot_step = sys->joints_cmds_dot.block(std::floor(cntr_outer_loop/sys->n_time_steps_inner_loop),0,1,sys->n_dims);
 
                 // Integrate dmp
-                dmpsds->dmp->integrateStep((double)dt,x,x_updated,xd_updated);
+                dmpsds->dmp->integrateStep(dmpsds->dt,x,x_updated,xd_updated); //FIX: Should I use the dt from the thread?
+		
+		//FIX now it is not in closed loop
+		x = x_updated; // is it rt safe?
 
                 StepHumanoidShm(cntr_outer_loop,x_updated,xd_updated);
 
@@ -233,23 +233,35 @@ int main (void)
         RT_TASK* task;
         M3DMPSds* dmpsds;
 
-        signal(SIGINT, endme);
-
-        if (dmpsds = (M3DMPSds*)rt_shm_alloc(nam2num(BOT_SHM),sizeof(M3DMPSds),USE_VMALLOC))
+	if (dmpsds = (M3DMPSds*)rt_shm_alloc(nam2num(BOT_SHM),sizeof(M3DMPSds),USE_GFP_KERNEL)) //USE_VMALLOC
                 printf("Allocated shared memory, it's time to rock baby! \n");
         else
         {
                 printf("Rtai_malloc failure for %s\n",BOT_SHM);
                 return 0;
         }
+	
+        signal(SIGINT, endme);
 
         // GENERATE A TRAJECTORY
-        double tau = 10;
-        int n_time_steps_trajectory = 11;
-        int n_dims = 7;
-        VectorXd ts = VectorXd::LinSpaced(n_time_steps_trajectory,0,tau); // Time steps for the trajectory
-        Trajectory trajectory = getDemoTrajectory(ts,n_dims); // getDemoTrajectory() is implemented below main()
+        // Some default values for integration
+	double dt = 0.001; //sec
+	double Tf = 6; //sec
+	double Ti = 0.0;
+	int n_time_steps_trajectory = (int)((Tf-Ti)/dt) + 1 ;
 
+	// Some default values for dynamical system
+	//double tau = 0.6; 
+	int dim = 7;
+	VectorXd y_init(dim); 
+	y_init   << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+	VectorXd y_attr(dim);
+	y_attr << 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4;
+	
+	VectorXd ts = VectorXd::LinSpaced(n_time_steps_trajectory,Ti,Tf); // From Ti to Tf in n_time_steps_trajectory steps
+	
+	Trajectory trajectory = getDemoTrajectory(ts, y_init, y_attr, Tf, Ti);
+  
         // MAKE THE FUNCTION APPROXIMATORS
         // Initialize some meta parameters for training LWR function approximator
         int n_basis_functions = 25;
@@ -258,18 +270,19 @@ int main (void)
         MetaParametersLWR* meta_parameters = new MetaParametersLWR(input_dim,n_basis_functions,overlap);
         FunctionApproximatorLWR* fa_lwr = new FunctionApproximatorLWR(meta_parameters);
 
-        // Clone the function approximator for each dimension of the DMP
-        std::vector<FunctionApproximator*> function_approximators(n_dims);
-        for (int dd=0; dd<n_dims; dd++)
-          function_approximators[dd] = fa_lwr->clone();
-
-        // CONSTRUCT AND TRAIN THE DMP
-        // Initialize the DMP
-        dmpsds->dmp = new Dmp(n_dims, function_approximators, Dmp::KULVICIUS_2012_JOINING);
+	Dmp::DmpType dmp_type = Dmp::KULVICIUS_2012_JOINING;
+	dmp_type = Dmp::IJSPEERT_2002_MOVEMENT;
+	
+	std::vector<FunctionApproximator*> function_approximators(dim);    	
+	for (int dd=0; dd<dim; dd++)
+		function_approximators[dd] = fa_lwr->clone();
+	
+	dmpsds->dmp = new Dmp(dim,function_approximators,dmp_type);  
         // And train it. Passing the save_directory will make sure the results are saved to file.
         dmpsds->dmp->train(trajectory);
-        dmpsds->n_dims = n_dims;
-
+        dmpsds->n_dims = dim;
+	dmpsds->dt = dt;
+	
         rt_allow_nonroot_hrt();
 
         hst = rt_thread_create((void*)rt_system_thread, dmpsds, 10000);
@@ -296,25 +309,25 @@ int main (void)
         return 0;
 }
 
-Trajectory getDemoTrajectory(const VectorXd& ts, const int n_dims)
+Trajectory getDemoTrajectory(const VectorXd& ts, const VectorXd& y_first, const VectorXd& y_last, const double& Tf, const double& Ti)
 {
-  bool use_viapoint_traj= true;
-  if (use_viapoint_traj)
-  {
-    VectorXd y_first = VectorXd::Zero(n_dims);
-    VectorXd y_last  = VectorXd::Ones(n_dims) * 0.4;
-    double viapoint_time = 5;
+    //VectorXd y_first = VectorXd::Zero(n_dims);
+    //VectorXd y_last  = VectorXd::Ones(n_dims) * 0.3;
+    
+    assert(y_first.size() == y_last.size());
+    
+    int n_dims = y_first.size();
+    double viapoint_time = (Tf -Ti)/2;
     double viapoint_location = 0.2;
 
     VectorXd y_yd_ydd_viapoint = VectorXd::Zero(3*n_dims);
-    y_yd_ydd_viapoint.segment(0*n_dims,n_dims).fill(viapoint_location); // y
+    
+    for(int i = 0; i<n_dims; i++)
+	    y_yd_ydd_viapoint[i] = (y_last[i] - y_first[i])/2;
+    
+    //y_yd_ydd_viapoint.segment(0*n_dims,n_dims).fill(viapoint_location); // y
+    
     return  Trajectory::generatePolynomialTrajectoryThroughViapoint(ts,y_first,y_yd_ydd_viapoint,viapoint_time,y_last);
-  }
-  else
-  {
-    //int n_dims = 2;
-    VectorXd y_first = VectorXd::LinSpaced(n_dims,0.0,0.7); // Initial state
-    VectorXd y_last  = VectorXd::LinSpaced(n_dims,0.4,0.5); // Final state
-    return Trajectory::generateMinJerkTrajectory(ts, y_first, y_last);
-  }
 }
+
+
