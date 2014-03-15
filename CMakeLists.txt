@@ -68,9 +68,9 @@ include_directories(${M3RT_INCLUDE_DIR} ${RTAI_INCLUDE_DIR} ${M3_INCLUDE_DIR} ${
 #add_executable(demoMekaShmTrj src/MekaShmTrj.cpp)
 #target_link_libraries(demoMekaShmTrj ${LIBS})
 
-#add_executable(demoMekaShmDmp src/MekaShmDmp.cpp)
-#target_link_libraries(demoMekaShmDmp ${LIBS})
-#install(TARGETS demoMekaShmDmp DESTINATION ${CMAKE_SOURCE_DIR}/bin)
+add_executable(demoMekaShmDmp src/MekaShmDmp.cpp)
+target_link_libraries(demoMekaShmDmp ${LIBS})
+install(TARGETS demoMekaShmDmp DESTINATION ${CMAKE_SOURCE_DIR}/bin)
 
 add_executable(demoMekaShmDmpGen src/MekaShmDmpGen.cpp)
 target_link_libraries(demoMekaShmDmpGen ${LIBS})

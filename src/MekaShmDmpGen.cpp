@@ -48,21 +48,29 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #define BOT_SHM "TSHMM"
 #define BOT_CMD_SEM "TSHMC"
 #define BOT_STATUS_SEM "TSHMS"
-/*static M3HumanoidShmSdsCommand cmd;
-static M3HumanoidShmSdsStatus status;
-static int sds_status_size;
-static int sds_cmd_size;*/
+//static M3HumanoidShmSdsCommand cmd;
+//static M3HumanoidShmSdsStatus status;
+//static int sds_status_size = sizeof(M3HumanoidShmSdsStatus);;
+//static int sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
 
 using namespace Eigen;
 using namespace DmpBbo;
 
+bool getSemAddr(const char* sem_name,SEM* &sem){
+	sem = (SEM*)rt_get_adr(nam2num(sem_name));
+	if (!sem)
+		return false;
+	return true;
+}
+
 class M3ShmManager
 {
 	public:
-		M3ShmManager(){
-			sds_status_size = sizeof(M3HumanoidShmSdsStatus);
-			sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
+		M3ShmManager():sds_status_size(sizeof(M3HumanoidShmSdsStatus)),sds_cmd_size(sizeof(M3HumanoidShmSdsCommand)){
+			//sds_status_size = sizeof(M3HumanoidShmSdsStatus);
+			//sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
 			memset(&cmd, 0, sds_cmd_size); // Initialize cmd
+			memset(&status, 0, sds_status_size); // Initialize status
 		}
 		
 		~M3ShmManager(){
@@ -80,7 +88,6 @@ class M3ShmManager
 		M3Sds* m3_sds;
 		
 		bool statusSemInit(std::string sem_name){
-			
 			if(getSemAddr(sem_name.c_str(),status_sem))
 				return true;
 			else
@@ -102,9 +109,10 @@ class M3ShmManager
 		}
 		
 		////////////////////////// COMMAND /////////////////////////////
-		void stepCommand(VectorXd& joints_cmd,VectorXd& joints_cmd_dot)
-		{
-			for (int i = 0; i < joints_cmd.size(); i++) // FIX
+		void stepCommand(VectorXd& joints_cmd,VectorXd& joints_cmd_dot) // FIX: No checks now
+		{	
+			SetTimestamp(GetTimestamp()); //Pass back timestamp as a heartbeat
+			for (int i = 0; i < 7; i++) // FIX
 			{
 				cmd.right_arm.ctrl_mode[i] = JOINT_ARRAY_MODE_THETA_GC;
 				cmd.right_arm.q_desired[i] = joints_cmd[i];
@@ -113,23 +121,29 @@ class M3ShmManager
 				cmd.right_arm.q_stiffness[i] = 1.0;
 			}
 
+			
+			//std::cout << "command_sem " << command_sem << std::endl;
+			//std::cout << "sds_cmd_size " << sds_cmd_size << std::endl;
+			
+			
+			
 			// Lock the semaphore and copy the output data
 			rt_sem_wait(command_sem);
-			memcpy(m3_sds->cmd, &cmd, sds_cmd_size);
+			memcpy(m3_sds->cmd, &cmd, sds_cmd_size); // THis is failing somehow
 			rt_sem_signal(command_sem);
 			
 		}
 
 		////////////////////////// STATUS /////////////////////////////
-		void stepStatus(VectorXd& joints_status,VectorXd& joints_status_dot)
-		{
+		void stepStatus(VectorXd& joints_status,VectorXd& joints_status_dot) // FIX: No checks now
+		{	
 			// Lock the semaphore and copy the input data
 			rt_sem_wait(status_sem);
 			memcpy(&status, m3_sds->status, sds_status_size);
 			rt_sem_signal(status_sem);
 			
 			// Convert status into Eigen vector
-			for (int i = 0; i < joints_status.size(); i++) // FIX
+			for (int i = 0; i < 7; i++) // FIX
 			{
 				joints_status[i] = status.right_arm.theta[i];
 				joints_status_dot[i] = status.right_arm.thetadot[i];
@@ -144,13 +158,17 @@ class M3ShmManager
 			else
 				return false;
 		}
+		
+		///////  Timing functions:
+		void SetTimestamp(int64_t  timestamp)
+		{
+			cmd.timestamp = timestamp;
+			return;
+		}
 
-	protected:
-		bool getSemAddr(const char* sem_name,SEM* sem){
-			sem = (SEM*)rt_get_adr(nam2num(sem_name));
-			if (!sem)
-				return false;
-			return true;
+		int64_t GetTimestamp()
+		{
+			return status.timestamp;
 		}
 		
 };
@@ -230,6 +248,8 @@ Dmp* generateDemoDmp(double dt){
 
 void* dmpLoop(void* args){
 	
+	static M3ShmManager shm_manager;
+	
 	/*SEM* status_sem;
         SEM* command_sem;
 	
@@ -237,8 +257,6 @@ void* dmpLoop(void* args){
         sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
         memset(&cmd, 0, sds_cmd_size); // Initialize cmd
         */
-        
-	M3ShmManager shm_manager;
 	
 	// Retrain the dmp_data
 	DmpData* dmp_data = (DmpData*) args;
@@ -258,6 +276,7 @@ void* dmpLoop(void* args){
 		printf("ERROR: Cannot initialize dmp task\n");
 		return 0;
 	}
+	rt_allow_nonroot_hrt();
 	if(!shm_manager.m3sdsInit("TSHMM")){
 		printf("Unable to find the %s shared memory.\n","TSHMM");
 		rt_task_delete(dmp_task);
@@ -279,32 +298,44 @@ void* dmpLoop(void* args){
 	int dmp_dim = dmp_data->dmp->dim();
 	VectorXd x(dmp_dim),xd(dmp_dim),x_updated(dmp_dim),xd_updated(dmp_dim);
 	
-	// Dmp initialization
-	// Read the motors state
-	//shm_manager.stepStatus(x,xd); //FIX This is crashing badly
-	// Set the initial conditions
-        dmp_data->dmp->integrateStart(x,xd);
-	
 	// Start the real time task
 	printf("Starting real-time task\n");
 	rt_task_make_periodic(dmp_task, rt_get_time() + tick_period, tick_period);
+	mlockall(MCL_CURRENT | MCL_FUTURE); // Prevent memory swaps
 	rt_make_hard_real_time();
-
+	
+	// Dmp initialization
+	// Read the motors state
+	shm_manager.stepStatus(x,xd);
+	
+	// Set the initial conditions
+        dmp_data->dmp->integrateStart(x,xd);
+	
 	// RT Loop
 	//long long start_time, end_time, curr_dt;
 	while(1)
 	{
 		// Read the motors state
-		
+		//shm_manager.stepStatus(x,xd);
 		
 		//start_time = nano2count(rt_get_cpu_time_ns());
 		
 		// Integrate dmp
                dmp_data->dmp->integrateStep(dmp_data->dt,x,x_updated,xd_updated);
-		x = x_updated;
+	       
+	       	// Read the motors state
+		//shm_manager.stepStatus(x,xd);
+	       //std::cout << x <<std::endl;
+	       
+	       x = x_updated;
+	       
+	       // Write the motors state
+	       shm_manager.stepCommand(x_updated,xd_updated);
+	       
+		//x = x_updated;
 		
-		std::cout << "****" << std::endl;
-		std::cout << x.segment(0,7) << std::endl;
+		//std::cout << "****" << std::endl;
+		//std::cout << x.segment(0,7) << std::endl;
 		
 		//printf("LOOP -- Period time: %f\n",NANO2SEC((double)count2nano(curr_dt)));
 		
