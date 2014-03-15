@@ -23,7 +23,7 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #include <rtai.h>
 #include <rtai_sem.h>
 //#include <m3rt/base/m3ec_def.h>
-//#include <m3rt/base/m3rt_def.h>
+#include <m3rt/base/m3rt_def.h>
 #include <rtai_nam2num.h>
 #include <rtai_registry.h>
 #include <eigen3/Eigen/Core>
@@ -74,9 +74,14 @@ class M3ShmManager
 		}
 		
 		~M3ShmManager(){
-			delete status_sem;
-			delete command_sem;
-			delete m3_sds;
+			
+			//rt_shm_free ( nam2num ( ( shm_id+"M" ).c_str() ) );
+			rt_sem_delete ( command_sem );
+			rt_sem_delete ( status_sem );
+			
+			//delete status_sem;
+			//delete command_sem;
+			delete m3_sds; // Fix, see above how
 		}
 		
 		M3HumanoidShmSdsCommand cmd;
@@ -120,18 +125,15 @@ class M3ShmManager
 				cmd.right_arm.slew_rate_q_desired[i] = 300; // 10.0
 				cmd.right_arm.q_stiffness[i] = 1.0;
 			}
-
 			
-			//std::cout << "command_sem " << command_sem << std::endl;
-			//std::cout << "sds_cmd_size " << sds_cmd_size << std::endl;
-			
-			
+			/*std::cout << "command_sem " << command_sem << std::endl;
+			std::cout << "sds_cmd_size " << sds_cmd_size << std::endl;
+			std::cout << "m3_sds " << m3_sds << std::endl;*/
 			
 			// Lock the semaphore and copy the output data
 			rt_sem_wait(command_sem);
-			memcpy(m3_sds->cmd, &cmd, sds_cmd_size); // THis is failing somehow
+			memcpy(this->m3_sds->cmd, &cmd, sds_cmd_size); // This is failing somehow
 			rt_sem_signal(command_sem);
-			
 		}
 
 		////////////////////////// STATUS /////////////////////////////
@@ -139,21 +141,21 @@ class M3ShmManager
 		{	
 			// Lock the semaphore and copy the input data
 			rt_sem_wait(status_sem);
-			memcpy(&status, m3_sds->status, sds_status_size);
+			memcpy(&status, this->m3_sds->status, sds_status_size);
 			rt_sem_signal(status_sem);
 			
 			// Convert status into Eigen vector
 			for (int i = 0; i < 7; i++) // FIX
 			{
-				joints_status[i] = status.right_arm.theta[i];
-				joints_status_dot[i] = status.right_arm.thetadot[i];
+				joints_status[i] = DEG2RAD(status.right_arm.theta[i]);
+				//joints_status_dot[i] = DEG2RAD(status.right_arm.thetadot[i]);
 			}
 			
 			
 		}	
 		
 		bool m3sdsInit(std::string bot_shm_name){
-			if (m3_sds = (M3Sds*)rt_shm_alloc(nam2num(bot_shm_name.c_str()),sizeof(M3Sds),USE_GFP_KERNEL))
+			if (this->m3_sds = (M3Sds*)rt_shm_alloc(nam2num(bot_shm_name.c_str()),sizeof(M3Sds),USE_VMALLOC))
 				return true;
 			else
 				return false;
@@ -248,8 +250,6 @@ Dmp* generateDemoDmp(double dt){
 
 void* dmpLoop(void* args){
 	
-	static M3ShmManager shm_manager;
-	
 	/*SEM* status_sem;
         SEM* command_sem;
 	
@@ -277,6 +277,8 @@ void* dmpLoop(void* args){
 		return 0;
 	}
 	rt_allow_nonroot_hrt();
+	
+	static M3ShmManager shm_manager;
 	if(!shm_manager.m3sdsInit("TSHMM")){
 		printf("Unable to find the %s shared memory.\n","TSHMM");
 		rt_task_delete(dmp_task);
@@ -296,7 +298,7 @@ void* dmpLoop(void* args){
 	RTIME tick_period = nano2count(SEC2NANO(dmp_data->dt)); // This is ~=dt
 	
 	int dmp_dim = dmp_data->dmp->dim();
-	VectorXd x(dmp_dim),xd(dmp_dim),x_updated(dmp_dim),xd_updated(dmp_dim);
+	static VectorXd x(dmp_dim),xd(dmp_dim),x_updated(dmp_dim),xd_updated(dmp_dim);
 	
 	// Start the real time task
 	printf("Starting real-time task\n");
@@ -308,6 +310,10 @@ void* dmpLoop(void* args){
 	// Read the motors state
 	shm_manager.stepStatus(x,xd);
 	
+	/*rt_sem_wait(shm_manager.status_sem);
+        memcpy(&shm_manager.status, shm_manager.m3_sds->status, shm_manager.sds_status_size);
+        rt_sem_signal(shm_manager.status_sem);*/
+	
 	// Set the initial conditions
         dmp_data->dmp->integrateStart(x,xd);
 	
@@ -316,26 +322,34 @@ void* dmpLoop(void* args){
 	while(1)
 	{
 		// Read the motors state
-		//shm_manager.stepStatus(x,xd);
+		shm_manager.stepStatus(x,xd);
+		/*rt_sem_wait(shm_manager.status_sem);
+		memcpy(&shm_manager.status, shm_manager.m3_sds->status, shm_manager.sds_status_size);
+		rt_sem_signal(shm_manager.status_sem);*/
+		
+		//std::cout << "x READ" << std::endl;
+		//std::cout << x << std::endl;
 		
 		//start_time = nano2count(rt_get_cpu_time_ns());
 		
 		// Integrate dmp
                dmp_data->dmp->integrateStep(dmp_data->dt,x,x_updated,xd_updated);
-	       
-	       	// Read the motors state
-		//shm_manager.stepStatus(x,xd);
-	       //std::cout << x <<std::endl;
-	       
-	       x = x_updated;
+	       //x = x_updated;
 	       
 	       // Write the motors state
 	       shm_manager.stepCommand(x_updated,xd_updated);
-	       
-		//x = x_updated;
+	         
 		
-		//std::cout << "****" << std::endl;
-		//std::cout << x.segment(0,7) << std::endl;
+		std::cout << "* x *" << std::endl;
+		std::cout << x.segment(0,7) << std::endl;
+		
+		std::cout << "* x_updated *" << std::endl;
+		std::cout << x_updated.segment(0,7) << std::endl;
+		
+		//std::cout << "* x_updated COMMAND *" << std::endl;
+		//std::cout << x_updated << std::endl;
+		
+		//getchar();
 		
 		//printf("LOOP -- Period time: %f\n",NANO2SEC((double)count2nano(curr_dt)));
 		
@@ -343,6 +357,7 @@ void* dmpLoop(void* args){
 		rt_task_wait_period();
 		//end_time = nano2count(rt_get_cpu_time_ns());
 		//curr_dt = end_time - start_time;
+		
 	}
 
 	// Task terminated
@@ -355,7 +370,7 @@ int main(int argc, char *argv[])
 {
 	// Generate a demo dmp and the shared data structure
 	DmpData* dmp_data = new DmpData;
-	dmp_data->dt = 0.01;
+	dmp_data->dt = 0.025;
 	dmp_data->dmp = generateDemoDmp(dmp_data->dt);
 
 	// Create a thread

@@ -199,6 +199,9 @@ static void* rt_system_thread(void * arg)
 
                 StepHumanoidShm(cntr_outer_loop,x_updated,xd_updated);
 
+		std::cout << "****" << std::endl;
+		std::cout << x.segment(0,7) << std::endl;
+		
                 rt_sem_wait(command_sem);
                 memcpy(dmpsds->m3sds.cmd, &cmd, sds_cmd_size);
                 rt_sem_signal(command_sem);
