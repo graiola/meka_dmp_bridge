@@ -52,9 +52,47 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 //static M3HumanoidShmSdsStatus status;
 //static int sds_status_size = sizeof(M3HumanoidShmSdsStatus);;
 //static int sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
+//static int sys_thread_active = 0;
+static int stop_thread = 0;
+static void end_thread(int dummy) { stop_thread = 1; }
+
+
+#include <iostream>
+#include <fstream> 
+#include <iterator>
 
 using namespace Eigen;
 using namespace DmpBbo;
+
+using namespace std;
+void WriteTxtFile( const char* filename,std::vector<std::vector<double> >& values ) {
+    ofstream myfile (filename);
+    size_t row = 0;
+    size_t col = 0;
+    size_t nb_rows = values.size();
+    size_t nb_cols = values[0].size();
+    if (myfile.is_open())
+    {
+        while(row < nb_rows) {
+	    while(col < nb_cols){
+		if (col == nb_cols-1)
+			myfile << values[row][col] << "\n";
+		else
+			myfile << values[row][col] << " ";
+		col++;  
+	 }
+	    col=0;
+            row++;
+        }
+        myfile.close();
+	std::cout << "File ["<<filename<<"] write with success  ["<<nb_rows<<" rows, "<<nb_cols<<" cols] "<<std::endl;
+    }
+    else{
+	 std::cout << "Unable to open file : ["<<filename<<"]"<<std::endl;
+	 getchar();
+    }
+    return;
+}
 
 bool getSemAddr(const char* sem_name,SEM* &sem){
 	sem = (SEM*)rt_get_adr(nam2num(sem_name));
@@ -261,6 +299,10 @@ void* dmpLoop(void* args){
 	// Retrain the dmp_data
 	DmpData* dmp_data = (DmpData*) args;
 	
+	std::vector<double> curr_x;
+	std::vector<std::vector<double> > out_x;
+	curr_x.resize(7);
+	
 	// Attach the thread to the shared memory
 	//M3Sds* m3_sds = new M3Sds;
 	/*if(!attachM3Sds(m3_sds)){
@@ -319,13 +361,18 @@ void* dmpLoop(void* args){
 	
 	// RT Loop
 	//long long start_time, end_time, curr_dt;
-	while(1)
+	//sys_thread_active = 1;
+	while(!stop_thread)
 	{
 		// Read the motors state
-		shm_manager.stepStatus(x,xd);
-		/*rt_sem_wait(shm_manager.status_sem);
+		//shm_manager.stepStatus(x,xd);
+		
+		//std::cout << "* x *" << std::endl;
+		//std::cout << x.segment(0,7) << std::endl;
+		
+		rt_sem_wait(shm_manager.status_sem);
 		memcpy(&shm_manager.status, shm_manager.m3_sds->status, shm_manager.sds_status_size);
-		rt_sem_signal(shm_manager.status_sem);*/
+		rt_sem_signal(shm_manager.status_sem);
 		
 		//std::cout << "x READ" << std::endl;
 		//std::cout << x << std::endl;
@@ -334,40 +381,45 @@ void* dmpLoop(void* args){
 		
 		// Integrate dmp
                dmp_data->dmp->integrateStep(dmp_data->dt,x,x_updated,xd_updated);
-	       //x = x_updated;
+	       x = x_updated;
 	       
 	       // Write the motors state
 	       shm_manager.stepCommand(x_updated,xd_updated);
-	         
 		
-		std::cout << "* x *" << std::endl;
-		std::cout << x.segment(0,7) << std::endl;
+		//std::cout << "* x_updated *" << std::endl;
+		//std::cout << x_updated.segment(0,7) << std::endl;
 		
-		std::cout << "* x_updated *" << std::endl;
-		std::cout << x_updated.segment(0,7) << std::endl;
-		
+		for (int i = 0; i < 7; i++)
+			curr_x[i] = x[i];
+		out_x.push_back(curr_x);
 		//std::cout << "* x_updated COMMAND *" << std::endl;
 		//std::cout << x_updated << std::endl;
 		
 		//getchar();
 		
 		//printf("LOOP -- Period time: %f\n",NANO2SEC((double)count2nano(curr_dt)));
-		
+	
 		// And waits until the end of the period.
 		rt_task_wait_period();
 		//end_time = nano2count(rt_get_cpu_time_ns());
 		//curr_dt = end_time - start_time;
-		
 	}
 
+	// Write to file
+	WriteTxtFile("output.txt",out_x);
+	
 	// Task terminated
+	printf("Removing real-time task\n");
 	rt_task_delete(dmp_task);
+	//sys_thread_active = 0;
 	return 0;
 }	
 
 
 int main(int argc, char *argv[])
 {
+	signal(SIGINT, end_thread);
+	
 	// Generate a demo dmp and the shared data structure
 	DmpData* dmp_data = new DmpData;
 	dmp_data->dt = 0.025;

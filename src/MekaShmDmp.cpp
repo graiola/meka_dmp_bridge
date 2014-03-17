@@ -184,8 +184,8 @@ static void* rt_system_thread(void * arg)
                 // Convert status into Eigen vector
                 /*for (int i = 0; i < dmpsds->n_dims; i++)
                 {
-                    x(i) = status.right_arm.theta[i];
-                    xd(i) = status.right_arm.thetadot[i];
+                    x(i) = DEG2RAD(status.right_arm.theta[i]);
+                    xd(i) = DEG2RAD(status.right_arm.thetadot[i]);
                 }*/
 
                 //MatrixXd joints_cmds_step = sys->joints_cmds.block(std::floor(cntr_outer_loop/sys->n_time_steps_inner_loop),0,1,sys->n_dims);
@@ -195,7 +195,7 @@ static void* rt_system_thread(void * arg)
                 dmpsds->dmp->integrateStep(dmpsds->dt,x,x_updated,xd_updated); //FIX: Should I use the dt from the thread?
 		
 		//FIX now it is not in closed loop
-		x = x_updated; // is it rt safe?
+		//x = x_updated; // is it rt safe?
 
                 StepHumanoidShm(cntr_outer_loop,x_updated,xd_updated);
 
