@@ -1,21 +1,3 @@
-/*
-M3 -- Meka Robotics Real-Time Control System
-Copyright (c) 2010 Meka Robotics
-Author: edsinger@mekabot.com (Aaron Edsinger)
-
-M3 is free software: you can redistribute it and/or modify
-it under the terms of the GNU Lesser General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-M3 is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public License
-along with M3.  If not, see <http://www.gnu.org/licenses/>.
-*/
 //////////////////////////////////// RT/M3 //////////////////////////////////////
 #include <rtai_sched.h>
 #include <stdio.h>
@@ -27,8 +9,11 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #include <m3rt/base/m3rt_def.h>
 #include <rtai_nam2num.h>
 #include <rtai_registry.h>
-#include <eigen3/Eigen/Core>
+#include <Eigen/Core>
 #include "m3/robots/humanoid_shm_sds.h"
+
+//////////////////////////////////// M3 IK (Gen) //////////////////////////////////////
+#include <meka_kinematics/m3kinematics.h>
 
 //////////////////////////////////// DMP //////////////////////////////////////
 #include "dmp/Dmp.hpp"
@@ -57,6 +42,7 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 //#define CLOSED_LOOP //Uncomment to close the loop
 static int stop_thread = 0;
 static void end_thread(int dummy) { stop_thread = 1; }
+
 
 using namespace Eigen;
 using namespace DmpBbo;
@@ -225,16 +211,14 @@ Trajectory generateViapointTrajectory(const VectorXd& ts, const VectorXd& y_firs
     return  Trajectory::generatePolynomialTrajectoryThroughViapoint(ts,y_first,y_yd_ydd_viapoint,viapoint_time,y_last);
 }
 
-Dmp* generateDemoDmp(double dt, int Ndof, double Ti, double Tf, int& n_time_steps_trajectory){
+Dmp* generateDemoDmpJoints(double dt, int Ndof, double Ti, double Tf, int& n_time_steps_trajectory){
 
 	// GENERATE A TRAJECTORY
 	n_time_steps_trajectory = (int)((Tf-Ti)/dt) + 1;
 
 	// Some default values for dynamical system
-	VectorXd y_init(Ndof); 
-	y_init   << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
-	VectorXd y_attr(Ndof);
-	y_attr << 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4;
+	VectorXd y_init = VectorXd::Zero(Ndof);
+	VectorXd y_attr  = VectorXd::Ones(Ndof) * 0.4;
 	
 	VectorXd ts = VectorXd::LinSpaced(n_time_steps_trajectory,Ti,Tf); // From Ti to Tf in n_time_steps_trajectory steps
 	
@@ -264,10 +248,92 @@ Dmp* generateDemoDmp(double dt, int Ndof, double Ti, double Tf, int& n_time_step
 	return dmp;  
 }
 
+Dmp* generateDemoDmpCartesian(double dt, int Ndof, double Ti, double Tf, int& n_time_steps_trajectory){
+
+	// GENERATE A TRAJECTORY
+	n_time_steps_trajectory = (int)((Tf-Ti)/dt) + 1;
+
+	// Some default values for dynamical system
+	//VectorXd y_init(Ndof); 
+	
+	VectorXd y_init = VectorXd::Zero(Ndof);
+	VectorXd y_attr  = VectorXd::Ones(Ndof) * 0.1;
+	
+	//y_init   << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+	//VectorXd y_attr(Ndof);
+	//y_attr << 0.4, 0.4, 0.4, 0.0, 0.0, 0.0;
+	
+	VectorXd ts = VectorXd::LinSpaced(n_time_steps_trajectory,Ti,Tf); // From Ti to Tf in n_time_steps_trajectory steps
+	
+	Trajectory trajectory = generateViapointTrajectory(ts, y_init, y_attr, Tf, Ti);
+  
+        // MAKE THE FUNCTION APPROXIMATORS
+        // Initialize some meta parameters for training LWR function approximator
+        int n_basis_functions = 25;
+        int input_dim = 1;
+        double overlap = 0.01;
+        MetaParametersLWR* meta_parameters = new MetaParametersLWR(input_dim,n_basis_functions,overlap);
+        FunctionApproximatorLWR* fa_lwr = new FunctionApproximatorLWR(meta_parameters);
+
+	//Dmp::DmpType dmp_type = Dmp::KULVICIUS_2012_JOINING;
+	Dmp::DmpType dmp_type = Dmp::IJSPEERT_2002_MOVEMENT;
+	
+	std::vector<FunctionApproximator*> function_approximators(Ndof);    	
+	for (int dd=0; dd<Ndof; dd++)
+		function_approximators[dd] = fa_lwr->clone();
+	
+	  /*Dmp(double tau, Eigen::VectorXd y_init, Eigen::VectorXd y_attr, std::vector<FunctionApproximator*> function_approximators, DmpType dmp_type=KULVICIUS_2012_JOINING);*/
+	
+	Dmp* dmp = new Dmp(Tf,y_init,y_attr,function_approximators,dmp_type);
+	
+	dmp->train(trajectory);
+	
+	return dmp;  
+}
+
+void dmpJoints(const DmpData* dmp_data, VectorXd& joints_status, VectorXd& joints_cmd, VectorXd& joints_dot_cmd){
+	// Integrate dmp
+	dmp_data->dmp->integrateStep(dmp_data->dt/10,joints_status,joints_cmd,joints_dot_cmd);
+	joints_status = joints_cmd;
+}
+
+void dmpCartesian(const DmpData* dmp_data, M3Kinematics& meka_kinematics, VectorXd& joints_status, VectorXd& joints_cmd, VectorXd& joints_dot_cmd){
+	
+	Vector3d tip_position; // FIX, pre-allocate
+	Matrix3d tip_orientation; // FIX, pre-allocate
+	int dmp_dim = dmp_data->dmp->dim();
+	int pose_dim = dmp_data->Ndof;
+	static VectorXd pose_status(dmp_dim),pose_cmd(dmp_dim),pose_dot_cmd(dmp_dim);
+	VectorXd v(pose_dim);
+	VectorXd qd(7); // FIX, Hardcoded
+	double gain = 100;
+	// FIX, pre-allocate
+	meka_kinematics.ComputeFk(joints_status,pose_status);
+	
+	// Integrate dmp
+	dmp_data->dmp->integrateStep(dmp_data->dt/10,pose_status,pose_cmd,pose_dot_cmd);
+	
+	//joints_vel = invJ*((error_pos_tmp) + pose_vel_desired);
+	//error_pos_tmp = pose_pos_desired-pose_pos;
+	
+	v = (gain * (pose_cmd.segment(0,pose_dim)-pose_status.segment(0,pose_dim)) + pose_cmd.segment(pose_dim,pose_dim));
+	
+	meka_kinematics.ComputeIk(pose_status,v,qd);
+	
+	joints_cmd.segment(0,7) = qd * dmp_data->dt/10 + joints_status.segment(0,7);
+	
+	pose_status = pose_cmd;
+	
+	//joints_status = joints_cmd;
+}
+
 void* dmpLoop(void* args){
 	
 	// Retrain the dmp_data
 	DmpData* dmp_data = (DmpData*) args;
+	
+	// Create the kinematic chain for the meka
+	M3Kinematics meka_kinematics;
 	
 	// Variables used to print positions and velocities on a txt file
 	std::vector<double> curr_x_cmd;
@@ -287,7 +353,7 @@ void* dmpLoop(void* args){
 	}
 	rt_allow_nonroot_hrt();
 	
-	static M3ShmManager shm_manager(dmp_data->Ndof);
+	M3ShmManager shm_manager(7); // FIX, Hardcoded
 	if(!shm_manager.m3sdsInit(BOT_SHM)){
 		printf("Unable to find the %s shared memory.\n","TSHMM");
 		rt_task_delete(dmp_task);
@@ -307,7 +373,13 @@ void* dmpLoop(void* args){
 	RTIME tick_period = nano2count(SEC2NANO(dmp_data->dt)); // This is ~=dt
 	
 	int dmp_dim = dmp_data->dmp->dim();
-	static VectorXd x_dummy(dmp_dim),x_cmd(dmp_dim),xd_cmd(dmp_dim),x_status(dmp_dim),xd_status(dmp_dim);
+	
+	static VectorXd joints_dummy(dmp_dim),joints_cmd(dmp_dim),joints_dot_cmd(dmp_dim),joints_status(dmp_dim),joints_dot_status(dmp_dim);
+	
+	//static VectorXd x_dummy(7),x_cmd(7),xd_cmd(7),x_status(7),xd_status(7);
+	
+	//Vector3d tip_position;
+	//Matrix3d tip_orientation;
 	
 	// Start the real time task
 	printf("Starting real-time task\n");
@@ -316,7 +388,7 @@ void* dmpLoop(void* args){
 	rt_make_hard_real_time();
 	
 	// Set the initial conditions
-        dmp_data->dmp->integrateStart(x_status,xd_status);
+        dmp_data->dmp->integrateStart(joints_status,joints_dot_status);
 	
 	// RT Loop
 	long long start_time, end_time, elapsed_time;
@@ -327,34 +399,42 @@ void* dmpLoop(void* args){
 	{
 		// Read the motors state
 #ifdef CLOSED_LOOP	
-		shm_manager.stepStatus(x_status);
-		x_dummy = x_status;
+		shm_manager.stepStatus(joints_status);
+		joints_dummy = joints_status;
 #else
-		shm_manager.stepStatus(x_dummy);
+		shm_manager.stepStatus(joints_dummy);
 #endif
+		
+		dmpJoints(dmp_data,joints_status,joints_cmd,joints_dot_cmd);
+		
 		// Save to std vectors (to write into a txt file)
-		for (unsigned int i = 0; i < curr_x_status.size(); i++){
-			curr_x_status[i] = x_dummy[i];
-			curr_x_cmd[i] = x_cmd[i];
+		/*for (unsigned int i = 0; i < curr_x_status.size(); i++){
+			curr_x_status[i] = joints_dummy[i];
+			curr_x_cmd[i] = joints_cmd[i];
 		}
 		out_x_status.push_back(curr_x_status);
-		out_x_cmd.push_back(curr_x_cmd);
+		out_x_cmd.push_back(curr_x_cmd);*/
 		
 		//start_time = nano2count(rt_get_cpu_time_ns());
 		
-		// Integrate dmp
-		dmp_data->dmp->integrateStep(dmp_data->dt/10,x_status,x_cmd,xd_cmd);
-	       
-		std::cout << "****" << "step: " << loop_cntr << "/"<< loop_steps << "****" << std::endl;
-		std::cout << "*** x_status ***" << std::endl;
-		std::cout << x_status << std::endl;
-		std::cout << "*** x_cmd ***" << std::endl;
-		std::cout << x_cmd << std::endl;
+		//void ComputeIk(const VectorXd& joints_pos, const VectorXd& v_in, VectorXd& qdot_out);
+		//meka_kinematics.ComputeIk(joints_status,);
 		
-		x_status = x_cmd;
+		
+		/*std::cout << "****" << "step: " << loop_cntr << "/"<< loop_steps << "****" << std::endl;
+		std::cout << "*** tip_position ***" << std::endl;
+		std::cout << tip_position << std::endl;
+		std::cout << "*** tip_orientation ***" << std::endl;
+		std::cout << tip_orientation << std::endl;*/
+		std::cout << "*** joints_status ***" << std::endl;
+		std::cout << joints_status << std::endl;
+		std::cout << "*** joints_cmd ***" << std::endl;
+		std::cout << joints_cmd << std::endl;
+		
+		
 
 		// Write the motors state
-		shm_manager.stepCommand(x_cmd);
+		shm_manager.stepCommand(joints_cmd);
 		
 		// And waits until the end of the period.
 		rt_task_wait_period();
@@ -373,8 +453,8 @@ void* dmpLoop(void* args){
 	rt_task_delete(dmp_task);
 	
 	// Write to file
-	WriteTxtFile("output_status_closed_loop.txt",out_x_status);
-	WriteTxtFile("output_cmd_closed_loop.txt",out_x_cmd);
+	WriteTxtFile("output_status.txt",out_x_status);
+	WriteTxtFile("output_cmd.txt",out_x_cmd);
 	
 	return 0;
 }	
@@ -390,7 +470,10 @@ int main(int argc, char *argv[])
 	double Ti = 0.0;
 	dmp_data->dt = 0.0250;
 	dmp_data->Ndof = 7;
-	dmp_data->dmp = generateDemoDmp(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
+	dmp_data->dmp = generateDemoDmpJoints(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
+	
+	//dmp_data->Ndof = 6;
+	//dmp_data->dmp = generateDemoDmpCartesian(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
 	
 	// Create a thread
 	rt_allow_nonroot_hrt(); // It is necessary to spawn tasks
