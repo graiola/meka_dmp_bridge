@@ -39,7 +39,7 @@
 #define BOT_SHM "TSHMM"
 #define BOT_CMD_SEM "TSHMC"
 #define BOT_STATUS_SEM "TSHMS"
-//#define CLOSED_LOOP //Uncomment to close the loop
+#define CLOSED_LOOP //Uncomment to close the loop
 static int stop_thread = 0;
 static void end_thread(int dummy) { stop_thread = 1; }
 
@@ -206,7 +206,7 @@ Trajectory generateViapointTrajectory(const VectorXd& ts, const VectorXd& y_firs
     VectorXd y_yd_ydd_viapoint = VectorXd::Zero(3*n_dims);
     
     for(int i = 0; i<n_dims; i++)
-	    y_yd_ydd_viapoint[i] = 0.5;//(y_last[i] - y_first[i])/2;
+	    y_yd_ydd_viapoint[i] = (y_last[i] - y_first[i])/2;
     
     return  Trajectory::generatePolynomialTrajectoryThroughViapoint(ts,y_first,y_yd_ydd_viapoint,viapoint_time,y_last);
 }
@@ -257,11 +257,11 @@ Dmp* generateDemoDmpCartesian(double dt, int Ndof, double Ti, double Tf, int& n_
 	//VectorXd y_init(Ndof); 
 	
 	VectorXd y_init = VectorXd::Zero(Ndof);
-	VectorXd y_attr  = VectorXd::Ones(Ndof) * 0.1;
+	VectorXd y_attr(Ndof);//  = VectorXd::Ones(Ndof) * 0.1;
 	
 	//y_init   << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
 	//VectorXd y_attr(Ndof);
-	//y_attr << 0.4, 0.4, 0.4, 0.0, 0.0, 0.0;
+	y_attr << 0.2, -0.1, -0.5, 0.0, 0.0, 0.0;
 	
 	VectorXd ts = VectorXd::LinSpaced(n_time_steps_trajectory,Ti,Tf); // From Ti to Tf in n_time_steps_trajectory steps
 	
@@ -291,22 +291,34 @@ Dmp* generateDemoDmpCartesian(double dt, int Ndof, double Ti, double Tf, int& n_
 	return dmp;  
 }
 
-void dmpJoints(const DmpData* dmp_data, VectorXd& joints_status, VectorXd& joints_cmd, VectorXd& joints_dot_cmd){
+void dmpJoints(const DmpData* dmp_data, const int& loop_cntr, VectorXd& joints_status, VectorXd& joints_cmd, VectorXd& joints_dot_cmd){
+	
+	if(loop_cntr == 0){ // HACK
+		// Set the initial conditions
+		dmp_data->dmp->integrateStart(joints_status,joints_dot_cmd); // FIX joints_dot_cmd???
+	}
+	
 	// Integrate dmp
 	dmp_data->dmp->integrateStep(dmp_data->dt/10,joints_status,joints_cmd,joints_dot_cmd);
 	joints_status = joints_cmd;
 }
 
-void dmpCartesian(const DmpData* dmp_data, M3Kinematics& meka_kinematics, VectorXd& joints_status, VectorXd& joints_cmd, VectorXd& joints_dot_cmd){
+void dmpCartesian(const DmpData* dmp_data, const int& loop_cntr, M3Kinematics& meka_kinematics, VectorXd& joints_status, VectorXd& joints_cmd, VectorXd& joints_dot_cmd){
 	
 	Vector3d tip_position; // FIX, pre-allocate
 	Matrix3d tip_orientation; // FIX, pre-allocate
 	int dmp_dim = dmp_data->dmp->dim();
 	int pose_dim = dmp_data->Ndof;
 	static VectorXd pose_status(dmp_dim),pose_cmd(dmp_dim),pose_dot_cmd(dmp_dim);
+	
+	if(loop_cntr == 0){ // HACK
+		// Set the initial conditions
+		dmp_data->dmp->integrateStart(pose_status,pose_dot_cmd); // FIX pose_dot_cmd???
+	}
+	
 	VectorXd v(pose_dim);
 	VectorXd qd(7); // FIX, Hardcoded
-	double gain = 100;
+	double gain = 1000;
 	// FIX, pre-allocate
 	meka_kinematics.ComputeFk(joints_status,pose_status);
 	
@@ -387,9 +399,6 @@ void* dmpLoop(void* args){
 	mlockall(MCL_CURRENT | MCL_FUTURE); // Prevent memory swaps
 	rt_make_hard_real_time();
 	
-	// Set the initial conditions
-        dmp_data->dmp->integrateStart(joints_status,joints_dot_status);
-	
 	// RT Loop
 	long long start_time, end_time, elapsed_time;
 	start_time = nano2count(rt_get_cpu_time_ns());
@@ -405,7 +414,9 @@ void* dmpLoop(void* args){
 		shm_manager.stepStatus(joints_dummy);
 #endif
 		
-		dmpJoints(dmp_data,joints_status,joints_cmd,joints_dot_cmd);
+		//dmpJoints(dmp_data,loop_cntr,joints_status,joints_cmd,joints_dot_cmd);
+		
+		dmpCartesian(dmp_data,loop_cntr,meka_kinematics,joints_status,joints_cmd,joints_dot_cmd);
 		
 		// Save to std vectors (to write into a txt file)
 		/*for (unsigned int i = 0; i < curr_x_status.size(); i++){
@@ -419,7 +430,6 @@ void* dmpLoop(void* args){
 		
 		//void ComputeIk(const VectorXd& joints_pos, const VectorXd& v_in, VectorXd& qdot_out);
 		//meka_kinematics.ComputeIk(joints_status,);
-		
 		
 		/*std::cout << "****" << "step: " << loop_cntr << "/"<< loop_steps << "****" << std::endl;
 		std::cout << "*** tip_position ***" << std::endl;
@@ -466,14 +476,15 @@ int main(int argc, char *argv[])
 	
 	// Generate a demo dmp and the shared data structure
 	DmpData* dmp_data = new DmpData;
-	double Tf = 3; //sec
+	double Tf = 6; //sec
 	double Ti = 0.0;
 	dmp_data->dt = 0.0250;
-	dmp_data->Ndof = 7;
-	dmp_data->dmp = generateDemoDmpJoints(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
 	
-	//dmp_data->Ndof = 6;
-	//dmp_data->dmp = generateDemoDmpCartesian(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
+	//dmp_data->Ndof = 7;
+	//dmp_data->dmp = generateDemoDmpJoints(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
+	
+	dmp_data->Ndof = 6;
+	dmp_data->dmp = generateDemoDmpCartesian(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
 	
 	// Create a thread
 	rt_allow_nonroot_hrt(); // It is necessary to spawn tasks
