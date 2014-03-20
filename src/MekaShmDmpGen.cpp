@@ -48,7 +48,7 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #define BOT_SHM "TSHMM"
 #define BOT_CMD_SEM "TSHMC"
 #define BOT_STATUS_SEM "TSHMS"
-#define CLOSED_LOOP 1
+//#define CLOSED_LOOP
 //static M3HumanoidShmSdsCommand cmd;
 //static M3HumanoidShmSdsStatus status;
 //static int sds_status_size = sizeof(M3HumanoidShmSdsStatus);;
@@ -56,7 +56,6 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 //static int sys_thread_active = 0;
 static int stop_thread = 0;
 static void end_thread(int dummy) { stop_thread = 1; }
-
 
 #include <iostream>
 #include <fstream> 
@@ -105,7 +104,7 @@ bool getSemAddr(const char* sem_name,SEM* &sem){
 class M3ShmManager
 {
 	public:
-		M3ShmManager():sds_status_size(sizeof(M3HumanoidShmSdsStatus)),sds_cmd_size(sizeof(M3HumanoidShmSdsCommand)){
+		M3ShmManager(int Ndof):Ndof_(Ndof),sds_status_size(sizeof(M3HumanoidShmSdsStatus)),sds_cmd_size(sizeof(M3HumanoidShmSdsCommand)){
 			memset(&cmd, 0, sds_cmd_size); // Initialize cmd
 			memset(&status, 0, sds_status_size); // Initialize status
 		}
@@ -127,6 +126,7 @@ class M3ShmManager
 		SEM* command_sem;
 		M3Sds* m3_sds;
 		std::string bot_shm_name_;
+		int Ndof_;
 		
 		bool statusSemInit(std::string sem_name){
 			if(getSemAddr(sem_name.c_str(),status_sem))
@@ -145,7 +145,7 @@ class M3ShmManager
 		void stepCommand(VectorXd& joints_cmd) // FIX: No checks now
 		{	
 			SetTimestamp(GetTimestamp()); //Pass back timestamp as a heartbeat
-			for (int i = 0; i < 7; i++) // FIX
+			for (int i = 0; i < Ndof_; i++) // FIX
 			{
 				cmd.right_arm.ctrl_mode[i] = JOINT_ARRAY_MODE_THETA_GC;
 				cmd.right_arm.q_desired[i] = (mReal)joints_cmd[i];
@@ -167,7 +167,7 @@ class M3ShmManager
 			memcpy(&status, this->m3_sds->status, sds_status_size);
 			rt_sem_signal(status_sem);
 			// Convert status into Eigen vector
-			for (int i = 0; i < 7; i++) // FIX
+			for (int i = 0; i < Ndof_; i++) // FIX
 			{
 				joints_status[i] = DEG2RAD(status.right_arm.theta[i]); // pos
 				//joints_status[i+7] = DEG2RAD(status.right_arm.thetadot[i]); // vel
@@ -269,10 +269,10 @@ void* dmpLoop(void* args){
 	// Retrain the dmp_data
 	DmpData* dmp_data = (DmpData*) args;
 	
+	// Variables used to print on a txt file
 	std::vector<double> curr_x_cmd;
 	std::vector<std::vector<double> > out_x_cmd;
-	curr_x_cmd.resize(dmp_data->Ndof*2);
-	
+	curr_x_cmd.resize(dmp_data->Ndof*2); // Store the velocities too
 	std::vector<double> curr_x_status;
 	std::vector<std::vector<double> > out_x_status;
 	curr_x_status.resize(dmp_data->Ndof*2);
@@ -287,7 +287,7 @@ void* dmpLoop(void* args){
 	}
 	rt_allow_nonroot_hrt();
 	
-	static M3ShmManager shm_manager;
+	static M3ShmManager shm_manager(dmp_data->Ndof);
 	if(!shm_manager.m3sdsInit(BOT_SHM)){
 		printf("Unable to find the %s shared memory.\n","TSHMM");
 		rt_task_delete(dmp_task);
@@ -307,7 +307,7 @@ void* dmpLoop(void* args){
 	RTIME tick_period = nano2count(SEC2NANO(dmp_data->dt)); // This is ~=dt
 	
 	int dmp_dim = dmp_data->dmp->dim();
-	static VectorXd x(dmp_dim),xd(dmp_dim),x_updated(dmp_dim),xd_updated(dmp_dim),x_motors(dmp_dim),xd_motors(dmp_dim);
+	static VectorXd x_dummy(dmp_dim),x_cmd(dmp_dim),xd_cmd(dmp_dim),x_status(dmp_dim),xd_status(dmp_dim);
 	
 	// Start the real time task
 	printf("Starting real-time task\n");
@@ -316,7 +316,7 @@ void* dmpLoop(void* args){
 	rt_make_hard_real_time();
 	
 	// Set the initial conditions
-        dmp_data->dmp->integrateStart(x,xd);
+        dmp_data->dmp->integrateStart(x_status,xd_status);
 	
 	// RT Loop
 	long long start_time, end_time, curr_dt, elapsed_time;
@@ -325,34 +325,35 @@ void* dmpLoop(void* args){
 	while(!stop_thread && loop_cntr <= 10*dmp_data->n_time_steps_trajectory)
 	{
 		// Read the motors state
-		shm_manager.stepStatus(x);
-		
+#ifdef CLOSED_LOOP	
+		shm_manager.stepStatus(x_status);
+		x_dummy = x_status;
+#else
+		shm_manager.stepStatus(x_dummy);
+#endif
 		// Save to std vectors (to write into a txt file)
 		for (int i = 0; i < curr_x_status.size(); i++){
-			curr_x_status[i] = x[i];
-			curr_x_cmd[i] = x_updated[i];
+			curr_x_status[i] = x_dummy[i];
+			curr_x_cmd[i] = x_cmd[i];
 		}
 		out_x_status.push_back(curr_x_status);
 		out_x_cmd.push_back(curr_x_cmd);
 		
 		//start_time = nano2count(rt_get_cpu_time_ns());
 		
-		/*for(int i = 7; i < 14; i++)
-			x[i] = x_updated[i];*/
-		
 		// Integrate dmp
-               dmp_data->dmp->integrateStep(dmp_data->dt/10,x,x_updated,xd_updated);
+               dmp_data->dmp->integrateStep(dmp_data->dt/10,x_status,x_cmd,xd_cmd);
 	       
 	        std::cout << "************" << std::endl;
-		std::cout << "*** x ***" << std::endl;
-		std::cout << x << std::endl;
-		std::cout << "*** x_updated ***" << std::endl;
-		std::cout << x_updated << std::endl;
+		std::cout << "*** x_status ***" << std::endl;
+		std::cout << x_status << std::endl;
+		std::cout << "*** x_cmd ***" << std::endl;
+		std::cout << x_cmd << std::endl;
 		
-		x = x_updated;
+		x_status = x_cmd;
 
 	       // Write the motors state
-	       shm_manager.stepCommand(x_updated);
+	       shm_manager.stepCommand(x_cmd);
 		
 		// And waits until the end of the period.
 		rt_task_wait_period();
@@ -363,7 +364,7 @@ void* dmpLoop(void* args){
 	}
 	end_time = nano2count(rt_get_cpu_time_ns());
 	elapsed_time = end_time - start_time;
-	printf("Elapsed time: %f s\n",(double)count2nano(elapsed_time)/1e9);
+	printf("Elapsed time: %f s\n",NANO2SEC((double)count2nano(elapsed_time)));
 	
 	// Write to file
 	WriteTxtFile("output_status_closed_loop_vel.txt",out_x_status);
