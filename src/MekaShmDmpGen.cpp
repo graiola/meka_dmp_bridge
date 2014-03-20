@@ -16,6 +16,7 @@ GNU Lesser General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License
 along with M3.  If not, see <http://www.gnu.org/licenses/>.
 */
+//////////////////////////////////// RT/M3 //////////////////////////////////////
 #include <rtai_sched.h>
 #include <stdio.h>
 #include <signal.h>
@@ -41,30 +42,26 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #include "functionapproximators/MetaParametersLWR.hpp"
 #include "functionapproximators/ModelParametersLWR.hpp"
 
-//////////////////////////////////// RT VARS //////////////////////////////////////
+//////////////////////////////////// STD //////////////////////////////////////
+#include <iostream>
+#include <fstream> 
+#include <iterator>
+
+//////////////////////////////////// RT DEFS //////////////////////////////////////
 //#define RT_TIMER_TICKS_NS_BOT_SHM (10000000) //Period of rt-timer expressed in ns 10000000/1e9 = 0.01s
 #define NANO2SEC(a)	a/1e9
 #define SEC2NANO(a)	a*1e9
 #define BOT_SHM "TSHMM"
 #define BOT_CMD_SEM "TSHMC"
 #define BOT_STATUS_SEM "TSHMS"
-//#define CLOSED_LOOP
-//static M3HumanoidShmSdsCommand cmd;
-//static M3HumanoidShmSdsStatus status;
-//static int sds_status_size = sizeof(M3HumanoidShmSdsStatus);;
-//static int sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
-//static int sys_thread_active = 0;
+//#define CLOSED_LOOP //Uncomment to close the loop
 static int stop_thread = 0;
 static void end_thread(int dummy) { stop_thread = 1; }
 
-#include <iostream>
-#include <fstream> 
-#include <iterator>
-
 using namespace Eigen;
 using namespace DmpBbo;
-
 using namespace std;
+
 void WriteTxtFile( const char* filename,std::vector<std::vector<double> >& values ) {
     ofstream myfile (filename);
     size_t row = 0;
@@ -103,6 +100,17 @@ bool getSemAddr(const char* sem_name,SEM* &sem){
 
 class M3ShmManager
 {
+	private:
+		int Ndof_;
+		M3HumanoidShmSdsCommand cmd;
+		M3HumanoidShmSdsStatus status;
+		int sds_status_size;
+		int sds_cmd_size;
+		SEM* status_sem;
+		SEM* command_sem;
+		M3Sds* m3_sds;
+		std::string bot_shm_name_;
+	
 	public:
 		M3ShmManager(int Ndof):Ndof_(Ndof),sds_status_size(sizeof(M3HumanoidShmSdsStatus)),sds_cmd_size(sizeof(M3HumanoidShmSdsCommand)){
 			memset(&cmd, 0, sds_cmd_size); // Initialize cmd
@@ -117,16 +125,6 @@ class M3ShmManager
 			//rt_sem_delete(status_sem);
 			rt_shm_free(nam2num(bot_shm_name_.c_str()));
 		}
-		
-		M3HumanoidShmSdsCommand cmd;
-		M3HumanoidShmSdsStatus status;
-		int sds_status_size;
-		int sds_cmd_size;
-		SEM* status_sem;
-		SEM* command_sem;
-		M3Sds* m3_sds;
-		std::string bot_shm_name_;
-		int Ndof_;
 		
 		bool statusSemInit(std::string sem_name){
 			if(getSemAddr(sem_name.c_str(),status_sem))
@@ -144,6 +142,7 @@ class M3ShmManager
 		////////////////////////// COMMAND /////////////////////////////
 		void stepCommand(VectorXd& joints_cmd) // FIX: No checks now
 		{	
+			assert(joints_cmd.size() >= Ndof_);
 			SetTimestamp(GetTimestamp()); //Pass back timestamp as a heartbeat
 			for (int i = 0; i < Ndof_; i++) // FIX
 			{
@@ -162,6 +161,7 @@ class M3ShmManager
 		////////////////////////// STATUS /////////////////////////////
 		void stepStatus(VectorXd& joints_status) // FIX: No checks now
 		{	
+			assert(joints_status.size() >= Ndof_);
 			// Lock the semaphore and copy the input data
 			rt_sem_wait(status_sem);
 			memcpy(&status, this->m3_sds->status, sds_status_size);
@@ -269,7 +269,7 @@ void* dmpLoop(void* args){
 	// Retrain the dmp_data
 	DmpData* dmp_data = (DmpData*) args;
 	
-	// Variables used to print on a txt file
+	// Variables used to print positions and velocities on a txt file
 	std::vector<double> curr_x_cmd;
 	std::vector<std::vector<double> > out_x_cmd;
 	curr_x_cmd.resize(dmp_data->Ndof*2); // Store the velocities too
@@ -319,10 +319,11 @@ void* dmpLoop(void* args){
         dmp_data->dmp->integrateStart(x_status,xd_status);
 	
 	// RT Loop
-	long long start_time, end_time, curr_dt, elapsed_time;
+	long long start_time, end_time, elapsed_time;
 	start_time = nano2count(rt_get_cpu_time_ns());
 	int loop_cntr = 0;
-	while(!stop_thread && loop_cntr <= 10*dmp_data->n_time_steps_trajectory)
+	int loop_steps = 10*dmp_data->n_time_steps_trajectory;
+	while(!stop_thread && loop_cntr <= loop_steps)
 	{
 		// Read the motors state
 #ifdef CLOSED_LOOP	
@@ -332,7 +333,7 @@ void* dmpLoop(void* args){
 		shm_manager.stepStatus(x_dummy);
 #endif
 		// Save to std vectors (to write into a txt file)
-		for (int i = 0; i < curr_x_status.size(); i++){
+		for (unsigned int i = 0; i < curr_x_status.size(); i++){
 			curr_x_status[i] = x_dummy[i];
 			curr_x_cmd[i] = x_cmd[i];
 		}
@@ -342,9 +343,9 @@ void* dmpLoop(void* args){
 		//start_time = nano2count(rt_get_cpu_time_ns());
 		
 		// Integrate dmp
-               dmp_data->dmp->integrateStep(dmp_data->dt/10,x_status,x_cmd,xd_cmd);
+		dmp_data->dmp->integrateStep(dmp_data->dt/10,x_status,x_cmd,xd_cmd);
 	       
-	        std::cout << "************" << std::endl;
+		std::cout << "****" << "step: " << loop_cntr << "/"<< loop_steps << "****" << std::endl;
 		std::cout << "*** x_status ***" << std::endl;
 		std::cout << x_status << std::endl;
 		std::cout << "*** x_cmd ***" << std::endl;
@@ -352,8 +353,8 @@ void* dmpLoop(void* args){
 		
 		x_status = x_cmd;
 
-	       // Write the motors state
-	       shm_manager.stepCommand(x_cmd);
+		// Write the motors state
+		shm_manager.stepCommand(x_cmd);
 		
 		// And waits until the end of the period.
 		rt_task_wait_period();
@@ -366,13 +367,15 @@ void* dmpLoop(void* args){
 	elapsed_time = end_time - start_time;
 	printf("Elapsed time: %f s\n",NANO2SEC((double)count2nano(elapsed_time)));
 	
-	// Write to file
-	WriteTxtFile("output_status_closed_loop_vel.txt",out_x_status);
-	WriteTxtFile("output_cmd_closed_loop_vel.txt",out_x_cmd);
-	
 	// Task terminated
 	printf("Removing real-time task\n");
+	//rt_make_soft_real_time();
 	rt_task_delete(dmp_task);
+	
+	// Write to file
+	WriteTxtFile("output_status_closed_loop.txt",out_x_status);
+	WriteTxtFile("output_cmd_closed_loop.txt",out_x_cmd);
+	
 	return 0;
 }	
 
