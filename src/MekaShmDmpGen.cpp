@@ -48,6 +48,7 @@ along with M3.  If not, see <http://www.gnu.org/licenses/>.
 #define BOT_SHM "TSHMM"
 #define BOT_CMD_SEM "TSHMC"
 #define BOT_STATUS_SEM "TSHMS"
+#define CLOSED_LOOP 1
 //static M3HumanoidShmSdsCommand cmd;
 //static M3HumanoidShmSdsStatus status;
 //static int sds_status_size = sizeof(M3HumanoidShmSdsStatus);;
@@ -105,21 +106,17 @@ class M3ShmManager
 {
 	public:
 		M3ShmManager():sds_status_size(sizeof(M3HumanoidShmSdsStatus)),sds_cmd_size(sizeof(M3HumanoidShmSdsCommand)){
-			//sds_status_size = sizeof(M3HumanoidShmSdsStatus);
-			//sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
 			memset(&cmd, 0, sds_cmd_size); // Initialize cmd
 			memset(&status, 0, sds_status_size); // Initialize status
 		}
 		
 		~M3ShmManager(){
-			
-			//rt_shm_free ( nam2num ( ( shm_id+"M" ).c_str() ) );
-			rt_sem_delete ( command_sem );
-			rt_sem_delete ( status_sem );
-			
-			//delete status_sem;
-			//delete command_sem;
-			delete m3_sds; // Fix, see above how
+			delete status_sem;
+			delete command_sem;
+			//delete m3_sds;
+			//rt_sem_delete(command_sem);
+			//rt_sem_delete(status_sem);
+			rt_shm_free(nam2num(bot_shm_name_.c_str()));
 		}
 		
 		M3HumanoidShmSdsCommand cmd;
@@ -129,30 +126,22 @@ class M3ShmManager
 		SEM* status_sem;
 		SEM* command_sem;
 		M3Sds* m3_sds;
+		std::string bot_shm_name_;
 		
 		bool statusSemInit(std::string sem_name){
 			if(getSemAddr(sem_name.c_str(),status_sem))
 				return true;
 			else
 				return false;
-			/*status_sem = (SEM*)rt_get_adr(nam2num(sem_name.c_str()));
-			if (!status_sem)
-				return false;
-			return true;*/
 		}
 		bool commandSemInit(std::string sem_name){
 			if(getSemAddr(sem_name.c_str(),command_sem))
 				return true;
 			else
 				return false;
-			/*command_sem = (SEM*)rt_get_adr(nam2num(sem_name.c_str()));
-			if (!status_sem)
-				return false;
-			return true;*/
 		}
 		
 		////////////////////////// COMMAND /////////////////////////////
-		//void stepCommand(VectorXd& joints_cmd,VectorXd& joints_cmd_dot) // FIX: No checks now
 		void stepCommand(VectorXd& joints_cmd) // FIX: No checks now
 		{	
 			SetTimestamp(GetTimestamp()); //Pass back timestamp as a heartbeat
@@ -164,11 +153,6 @@ class M3ShmManager
 				cmd.right_arm.slew_rate_q_desired[i] = 1000; // 10.0
 				cmd.right_arm.q_stiffness[i] = 1.0;
 			}
-			
-			/*std::cout << "command_sem " << command_sem << std::endl;
-			std::cout << "sds_cmd_size " << sds_cmd_size << std::endl;
-			std::cout << "m3_sds " << m3_sds << std::endl;*/
-			
 			// Lock the semaphore and copy the output data
 			rt_sem_wait(command_sem);
 			memcpy(this->m3_sds->cmd, &cmd, sds_cmd_size); // This is failing somehow
@@ -176,27 +160,25 @@ class M3ShmManager
 		}
 
 		////////////////////////// STATUS /////////////////////////////
-		//void stepStatus(VectorXd& joints_status,VectorXd& joints_status_dot) // FIX: No checks now
 		void stepStatus(VectorXd& joints_status) // FIX: No checks now
 		{	
 			// Lock the semaphore and copy the input data
 			rt_sem_wait(status_sem);
 			memcpy(&status, this->m3_sds->status, sds_status_size);
 			rt_sem_signal(status_sem);
-			
 			// Convert status into Eigen vector
 			for (int i = 0; i < 7; i++) // FIX
 			{
 				joints_status[i] = DEG2RAD(status.right_arm.theta[i]); // pos
 				//joints_status[i+7] = DEG2RAD(status.right_arm.thetadot[i]); // vel
 			}
-			
-			
 		}	
 		
 		bool m3sdsInit(std::string bot_shm_name){
-			if (this->m3_sds = (M3Sds*)rt_shm_alloc(nam2num(bot_shm_name.c_str()),sizeof(M3Sds),USE_VMALLOC))
+			if (this->m3_sds = (M3Sds*)rt_shm_alloc(nam2num(bot_shm_name.c_str()),sizeof(M3Sds),USE_VMALLOC)){
+				bot_shm_name_ = bot_shm_name; 
 				return true;
+			}
 			else
 				return false;
 		}
@@ -212,7 +194,6 @@ class M3ShmManager
 		{
 			return status.timestamp;
 		}
-		
 };
 
 /////// Shared data structure:
@@ -220,12 +201,13 @@ struct DmpData
 {
 	Dmp* dmp; 
 	double dt;
+	int Ndof;
 	int n_time_steps_trajectory;
 	~DmpData(){ delete dmp;}
 };
 
 ///////  Trajectory generator:
-Trajectory generateTrajectory(const VectorXd& ts, const VectorXd& y_first, const VectorXd& y_last, const double& Tf, const double& Ti)
+Trajectory generateViapointTrajectory(const VectorXd& ts, const VectorXd& y_first, const VectorXd& y_last, const double& Tf, const double& Ti)
 {
     //VectorXd y_first = VectorXd::Zero(n_dims);
     //VectorXd y_last  = VectorXd::Ones(n_dims) * 0.3;
@@ -238,33 +220,25 @@ Trajectory generateTrajectory(const VectorXd& ts, const VectorXd& y_first, const
     VectorXd y_yd_ydd_viapoint = VectorXd::Zero(3*n_dims);
     
     for(int i = 0; i<n_dims; i++)
-	    y_yd_ydd_viapoint[i] = (y_last[i] - y_first[i])/2;
-    
-    //y_yd_ydd_viapoint.segment(0*n_dims,n_dims).fill(viapoint_location); // y
+	    y_yd_ydd_viapoint[i] = 0.5;//(y_last[i] - y_first[i])/2;
     
     return  Trajectory::generatePolynomialTrajectoryThroughViapoint(ts,y_first,y_yd_ydd_viapoint,viapoint_time,y_last);
 }
 
-Dmp* generateDemoDmp(double dt, double Ti, double Tf, int& n_time_steps_trajectory){
+Dmp* generateDemoDmp(double dt, int Ndof, double Ti, double Tf, int& n_time_steps_trajectory){
 
 	// GENERATE A TRAJECTORY
-        // Some default values for integration
-	//double dt = 0.001; //sec
-	//double Tf = 10; //sec
-	//double Ti = 0.0;
 	n_time_steps_trajectory = (int)((Tf-Ti)/dt) + 1;
 
 	// Some default values for dynamical system
-	//double tau = 0.6; 
-	int dim = 7;
-	VectorXd y_init(dim); 
+	VectorXd y_init(Ndof); 
 	y_init   << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
-	VectorXd y_attr(dim);
-	y_attr << 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6;
+	VectorXd y_attr(Ndof);
+	y_attr << 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4;
 	
 	VectorXd ts = VectorXd::LinSpaced(n_time_steps_trajectory,Ti,Tf); // From Ti to Tf in n_time_steps_trajectory steps
 	
-	Trajectory trajectory = generateTrajectory(ts, y_init, y_attr, Tf, Ti);
+	Trajectory trajectory = generateViapointTrajectory(ts, y_init, y_attr, Tf, Ti);
   
         // MAKE THE FUNCTION APPROXIMATORS
         // Initialize some meta parameters for training LWR function approximator
@@ -277,45 +251,31 @@ Dmp* generateDemoDmp(double dt, double Ti, double Tf, int& n_time_steps_trajecto
 	//Dmp::DmpType dmp_type = Dmp::KULVICIUS_2012_JOINING;
 	Dmp::DmpType dmp_type = Dmp::IJSPEERT_2002_MOVEMENT;
 	
-	std::vector<FunctionApproximator*> function_approximators(dim);    	
-	for (int dd=0; dd<dim; dd++)
+	std::vector<FunctionApproximator*> function_approximators(Ndof);    	
+	for (int dd=0; dd<Ndof; dd++)
 		function_approximators[dd] = fa_lwr->clone();
 	
-	Dmp* dmp = new Dmp(dim,y_init,y_attr,function_approximators,dmp_type);
+	  /*Dmp(double tau, Eigen::VectorXd y_init, Eigen::VectorXd y_attr, std::vector<FunctionApproximator*> function_approximators, DmpType dmp_type=KULVICIUS_2012_JOINING);*/
+	
+	Dmp* dmp = new Dmp(Tf,y_init,y_attr,function_approximators,dmp_type);
 	
 	dmp->train(trajectory);
 	
 	return dmp;  
-	
 }
 
 void* dmpLoop(void* args){
 	
-	/*SEM* status_sem;
-        SEM* command_sem;
-	
-	sds_status_size = sizeof(M3HumanoidShmSdsStatus);
-        sds_cmd_size = sizeof(M3HumanoidShmSdsCommand);
-        memset(&cmd, 0, sds_cmd_size); // Initialize cmd
-        */
-	
 	// Retrain the dmp_data
 	DmpData* dmp_data = (DmpData*) args;
 	
-	std::vector<double> curr_x_dmp;
-	std::vector<std::vector<double> > out_x_dmp;
-	curr_x_dmp.resize(7);
+	std::vector<double> curr_x_cmd;
+	std::vector<std::vector<double> > out_x_cmd;
+	curr_x_cmd.resize(dmp_data->Ndof*2);
 	
-	std::vector<double> curr_x_motors;
-	std::vector<std::vector<double> > out_x_motors;
-	curr_x_motors.resize(7);
-	
-	// Attach the thread to the shared memory
-	//M3Sds* m3_sds = new M3Sds;
-	/*if(!attachM3Sds(m3_sds)){
-		printf("ERROR: Cannot attach the thread to the m3 shared data structure\n");
-		return 0;
-	}*/
+	std::vector<double> curr_x_status;
+	std::vector<std::vector<double> > out_x_status;
+	curr_x_status.resize(dmp_data->Ndof*2);
 	
 	// Create the dmp task
 	RT_TASK* dmp_task;
@@ -328,17 +288,17 @@ void* dmpLoop(void* args){
 	rt_allow_nonroot_hrt();
 	
 	static M3ShmManager shm_manager;
-	if(!shm_manager.m3sdsInit("TSHMM")){
+	if(!shm_manager.m3sdsInit(BOT_SHM)){
 		printf("Unable to find the %s shared memory.\n","TSHMM");
 		rt_task_delete(dmp_task);
 		return 0;
 	}
-	if(!shm_manager.statusSemInit("TSHMS")){
+	if(!shm_manager.statusSemInit(BOT_STATUS_SEM)){
 		printf("Unable to find the %s semaphore.\n","TSHMS");
 		rt_task_delete(dmp_task);
 		return 0;
 	}
-	if(!shm_manager.commandSemInit("TSHMC")){
+	if(!shm_manager.commandSemInit(BOT_CMD_SEM)){
 		printf("Unable to find the %s semaphore.\n","TSHMC");
 		rt_task_delete(dmp_task);
 		return 0;
@@ -355,14 +315,6 @@ void* dmpLoop(void* args){
 	mlockall(MCL_CURRENT | MCL_FUTURE); // Prevent memory swaps
 	rt_make_hard_real_time();
 	
-	// Dmp initialization
-	// Read the motors state
-	//shm_manager.stepStatus(x_motors);
-	
-	/*rt_sem_wait(shm_manager.status_sem);
-        memcpy(&shm_manager.status, shm_manager.m3_sds->status, shm_manager.sds_status_size);
-        rt_sem_signal(shm_manager.status_sem);*/
-	
 	// Set the initial conditions
         dmp_data->dmp->integrateStart(x,xd);
 	
@@ -372,26 +324,24 @@ void* dmpLoop(void* args){
 	int loop_cntr = 0;
 	while(!stop_thread && loop_cntr <= 10*dmp_data->n_time_steps_trajectory)
 	{
-		
 		// Read the motors state
 		shm_manager.stepStatus(x);
 		
 		// Save to std vectors (to write into a txt file)
-		for (int i = 0; i < curr_x_motors.size(); i++){
-			curr_x_motors[i] = x[i];
-			curr_x_dmp[i] = x_updated[i];
+		for (int i = 0; i < curr_x_status.size(); i++){
+			curr_x_status[i] = x[i];
+			curr_x_cmd[i] = x_updated[i];
 		}
-		out_x_motors.push_back(curr_x_motors);
-		out_x_dmp.push_back(curr_x_dmp);
-		
-		/*rt_sem_wait(shm_manager.status_sem);
-		memcpy(&shm_manager.status, shm_manager.m3_sds->status, shm_manager.sds_status_size);
-		rt_sem_signal(shm_manager.status_sem);*/
+		out_x_status.push_back(curr_x_status);
+		out_x_cmd.push_back(curr_x_cmd);
 		
 		//start_time = nano2count(rt_get_cpu_time_ns());
 		
+		/*for(int i = 7; i < 14; i++)
+			x[i] = x_updated[i];*/
+		
 		// Integrate dmp
-               dmp_data->dmp->integrateStep(dmp_data->dt,x,x_updated,xd_updated);
+               dmp_data->dmp->integrateStep(dmp_data->dt/10,x,x_updated,xd_updated);
 	       
 	        std::cout << "************" << std::endl;
 		std::cout << "*** x ***" << std::endl;
@@ -400,39 +350,28 @@ void* dmpLoop(void* args){
 		std::cout << x_updated << std::endl;
 		
 		x = x_updated;
-		//getchar();
 
-		// Keep the velocity from dmps
-		/*for (int i = 7; i < 14; i++){
-			x[i] = x_updated[i];
-		}*/
-		
 	       // Write the motors state
 	       shm_manager.stepCommand(x_updated);
 		
-		//std::cout << "* x_updated *" << std::endl;
-		//std::cout << x_updated.segment(0,7) << std::endl;
-	
 		// And waits until the end of the period.
 		rt_task_wait_period();
+		
 		//end_time = nano2count(rt_get_cpu_time_ns());
 		//curr_dt = end_time - start_time;
-		
 		loop_cntr++;
 	}
 	end_time = nano2count(rt_get_cpu_time_ns());
 	elapsed_time = end_time - start_time;
 	printf("Elapsed time: %f s\n",(double)count2nano(elapsed_time)/1e9);
 	
-
 	// Write to file
-	WriteTxtFile("output_motors.txt",out_x_motors);
-	WriteTxtFile("output_dmp.txt",out_x_dmp);
+	WriteTxtFile("output_status_closed_loop_vel.txt",out_x_status);
+	WriteTxtFile("output_cmd_closed_loop_vel.txt",out_x_cmd);
 	
 	// Task terminated
 	printf("Removing real-time task\n");
 	rt_task_delete(dmp_task);
-	//sys_thread_active = 0;
 	return 0;
 }	
 
@@ -443,10 +382,11 @@ int main(int argc, char *argv[])
 	
 	// Generate a demo dmp and the shared data structure
 	DmpData* dmp_data = new DmpData;
-	double Tf = 10; //sec
+	double Tf = 3; //sec
 	double Ti = 0.0;
 	dmp_data->dt = 0.0250;
-	dmp_data->dmp = generateDemoDmp(dmp_data->dt,Ti,Tf,dmp_data->n_time_steps_trajectory);
+	dmp_data->Ndof = 7;
+	dmp_data->dmp = generateDemoDmp(dmp_data->dt,dmp_data->Ndof,Ti,Tf,dmp_data->n_time_steps_trajectory);
 	
 	// Create a thread
 	rt_allow_nonroot_hrt(); // It is necessary to spawn tasks
